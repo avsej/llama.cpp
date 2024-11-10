@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <signal.h>
@@ -3148,6 +3149,163 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get ("/slots",               handle_slots);
     svr->Post("/slots/:id_slot",      handle_slots_action);
+
+    // Files
+    const auto handle_files_list = [&](const httplib::Request &req,
+                                       httplib::Response &res) {
+            json files = {
+                {"object", "list"},
+                {"data", json::array()}
+            };
+
+            auto uploads_path = std::filesystem::current_path();
+            for (const auto& entry : std::filesystem::directory_iterator(uploads_path)) {
+                if (std::filesystem::is_regular_file(entry) && entry.path().extension() == ".meta") {
+                    std::ifstream file(entry.path(), std::ios::binary | std::ios::in);
+                    if (!file) {
+                        throw std::runtime_error("Failed to open file for reading meta");
+                    }
+                    json meta;
+                    file >> meta;
+                    files["data"].emplace_back(std::move(meta));
+                }
+            }
+
+            res.set_content(files.dump(), MIMETYPE_JSON);
+            res.status = 200;
+        };
+
+    const auto handle_files_get = [&](const httplib::Request &req,
+                                      httplib::Response &res) {
+
+            std::string file_id = req.path_params.at("file_id");
+            auto uploads_path = std::filesystem::current_path();
+
+            auto file_path = uploads_path / (file_id + ".meta");
+
+            if (!std::filesystem::is_regular_file(file_path)) {
+                res.status = 404;
+                return;
+            }
+
+            std::ifstream file(file_path, std::ios::binary | std::ios::in);
+            if (!file) {
+                throw std::runtime_error("Failed to open file for reading meta");
+            }
+            json meta;
+            file >> meta;
+
+            res.set_content(meta.dump(), MIMETYPE_JSON);
+            res.status = 200;
+        };
+
+
+    const auto handle_files_get_content = [&](const httplib::Request &req,
+                                              httplib::Response &res) {
+
+            std::string file_id = req.path_params.at("file_id");
+            auto uploads_path = std::filesystem::current_path();
+
+            auto file_path = uploads_path / (file_id + ".data");
+
+            if (!std::filesystem::is_regular_file(file_path)) {
+                res.status = 404;
+                return;
+            }
+
+            std::ifstream file(file_path, std::ios::binary | std::ios::in);
+            if (!file) {
+                throw std::runtime_error("Failed to open file for reading meta");
+            }
+
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+
+            res.set_content(buffer.str(), "application/octet-stream");
+            res.status = 200;
+        };
+
+
+    const auto handle_files_delete = [&](const httplib::Request &req,
+                                         httplib::Response &res,
+                                         const httplib::ContentReader &) {
+
+            std::string file_id = req.path_params.at("file_id");
+            auto uploads_path = std::filesystem::current_path();
+
+            auto file_path = uploads_path / (file_id + ".meta");
+
+            if (!std::filesystem::is_regular_file(file_path)) {
+                res.status = 404;
+                return;
+            }
+
+            std::filesystem::remove(file_path);
+            std::filesystem::remove(uploads_path / (file_id + ".data"));
+
+            json status = {
+                {
+                    {"id",       file_id},
+                    {"object",   "file"},
+                    {"deleted",   true},
+                },
+            };
+
+            res.set_content(status.dump(), MIMETYPE_JSON);
+            res.status = 200;
+        };
+
+    const auto handle_files_upload = [&](const httplib::Request &req,
+                                         httplib::Response &res) {
+            auto purpose = req.get_param_value("purpose");
+            auto file_value = req.get_file_value("file");
+            auto file_id = "file_" + std::to_string(std::time(0)) + std::to_string(rand());
+
+            auto uploads_path = std::filesystem::current_path();
+
+            {
+                std::ofstream file(uploads_path / (file_id + ".data"), std::ios::binary | std::ios::out | std::ios::trunc);
+                if (!file) {
+                    throw std::runtime_error("Failed to open file for writing content, id=" + file_id);
+                }
+                file.write(file_value.content.data(), file_value.content.size());
+                if (!file.good()) {
+                    throw std::runtime_error("Error writing to file, id=" + file_id);
+                }
+            }
+
+            json meta = {
+                {
+                    {"id",       file_id},
+                    {"object",   "file"},
+                    {"bytes",   std::filesystem::file_size(file_id + ".data")},
+                    {"created",  std::time(0)},
+                    {"filename",  file_value.filename},
+                    {"purpose",  purpose},
+                },
+            };
+            auto meta_str = meta.dump();
+
+            {
+                std::ofstream file(uploads_path / (file_id + ".meta"), std::ios::binary | std::ios::out | std::ios::trunc);
+                if (!file) {
+                    throw std::runtime_error("Failed to open file for writing meta, id=" + file_id);
+                }
+                file.write(meta_str.data(), meta_str.size());
+                if (!file.good()) {
+                    throw std::runtime_error("Error writing to file, id=" + file_id);
+                }
+            }
+
+            res.set_content(meta_str, MIMETYPE_JSON);
+            res.status = 200;
+        };
+
+    svr->Get("/v1/files", handle_files_list);
+    svr->Get("/v1/files/:file_id", handle_files_get);
+    svr->Get("/v1/files/:file_id/content", handle_files_get_content);
+    svr->Post("/v1/files", handle_files_upload);
+    svr->Delete("/v1/files/:file_id", handle_files_delete);
 
     //
     // Start the server
